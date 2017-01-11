@@ -30,8 +30,8 @@ var OTParser = _dereq_('object-tree')
 function AccessControlList(conf) {
 
   if(!conf) { throw new Error ('missing configuration') }
-  if(!conf.roles) { throw new Error('roles is required') }
-  if(!_.isArray(conf.roles)) { throw new Error('roles should be a string array') }
+  if(!conf.roles && conf.control !== 'entity') { throw new Error('roles is required') }
+  if(!_.isArray(conf.roles) && conf.control !== 'entity') { throw new Error('roles should be a string array') }
 
   this._roles = conf.roles
   this._name = conf.name || JSON.stringify(conf.roles)
@@ -52,9 +52,49 @@ function AccessControlList(conf) {
     this._filters = conf.filters
   }
 
+  if(conf.entityFields) {
+    this._entityFields = conf.entityFields
+  }
+
   this._conditions = conf.conditions || []
 
+  if (conf.inherit) {
+    this._inherit = conf.inherit
+  }
+
   this._objectParser = new OTParser()
+}
+
+AccessControlList.prototype.shouldApplyInherited = function(obj, action, roles, context) {
+  var inheritApply = {
+    ok: true
+  }
+  var self = this
+  if (self._inherit && context.inherit$) {
+    var skip = _.any(self._inherit.allow, function(allow) {
+      var rolesMatch = self._rolesMatch(allow.roles, roles)
+      if (rolesMatch.ok) {
+        var entityMatch = _.findWhere(allow.entities, context.inherit$.entityDef)
+        if (entityMatch) {
+          return _.all(allow.conditions, function(condition) {
+            var match = self._conditionMatch(condition, context.inherit$.entity, action, context)
+            return (match.ok === true)
+          })
+        }
+        else {
+          return false
+        }
+      }
+      else {
+        return false
+      }
+    })
+    if (skip) {
+      inheritApply.ok = false
+      inheritApply.reason = 'inherit pass through'
+    }
+  }
+  return inheritApply
 }
 
 AccessControlList.prototype.shouldApply = function(obj, action) {
@@ -382,6 +422,7 @@ AccessControlList.prototype.authorize = function(obj, action, roles, context, ca
   var inherit = []
   var shouldApply = this.shouldApply(obj, action)
   var filters = null
+  var entityFields = null
   var hard = this._hard
   var missing = null
   if(shouldApply.ok) {
@@ -416,6 +457,10 @@ AccessControlList.prototype.authorize = function(obj, action, roles, context, ca
         authorize = rolesMatch.ok
       }
 
+		if(this.control() === 'entity') {
+			entityFields = this.entityFields()
+		}
+
     } else {
       // conditions say this ACL does not apply
       if(this.control() === 'sufficient') {
@@ -438,7 +483,8 @@ AccessControlList.prototype.authorize = function(obj, action, roles, context, ca
       inherit: inherit,
       filters: filters,
       hard: hard,
-      missingRoles: missing
+      missingRoles: missing,
+      entityFields: entityFields
     })
   })
 }
@@ -447,7 +493,9 @@ AccessControlList.prototype._rolesMatch = function(expectedRoles, actualRoles) {
 
   var rolesMatch = {ok: true}
   var missingRoles = []
-  if(expectedRoles && expectedRoles.length > 0) {
+  var expectedRolesIsAnArray = expectedRoles && expectedRoles.length > 0;
+
+  if(expectedRolesIsAnArray) {
 
     // TODO: optimize this O(N square) into at least a O(N)
     for(var i = 0 ; i < expectedRoles.length ; i++) {
@@ -474,7 +522,9 @@ AccessControlList.prototype._rolesMatch = function(expectedRoles, actualRoles) {
       ' but got roles ' + JSON.stringify(actualRoles) +
       '. missing roles ' + JSON.stringify(missingRoles)
   } else if(rolesMatch.ok) {
-    rolesMatch.reason = 'roles match as expected: ' + expectedRoles.join(',')
+    rolesMatch.reason = expectedRolesIsAnArray
+      ? ('roles match as expected: ' + expectedRoles.join(','))
+      : 'roles not applicable'
   }
 
   return rolesMatch
@@ -486,6 +536,10 @@ AccessControlList.prototype.roles = function() {
 
 AccessControlList.prototype.control = function() {
   return this._control
+}
+
+AccessControlList.prototype.entityFields = function() {
+  return this._entityFields
 }
 
 AccessControlList.prototype.name = function() {
@@ -619,7 +673,14 @@ AccessControlProcedure.prototype._nextACL = function(obj, action, roles, accessC
 
   if(accessControls && accessControls.length > 0) {
     var accessControl = accessControls.shift()
+
     var shouldApply = accessControl.shouldApply(obj, action)
+
+    // inherited acls can be bypassed via inherit.allow on the acl definition
+    if (shouldApply.ok && context.inherit$) {
+      shouldApply = accessControl.shouldApplyInherited(obj, action, roles, context)
+    }
+
     if(shouldApply.ok) {
       //console.log('running authorization service', accessControl.name())
       accessControl.authorize(obj, action, roles, context, function(err, result) {
@@ -646,6 +707,14 @@ AccessControlProcedure.prototype._nextACL = function(obj, action, roles, accessC
         var stop = false
 
         switch(accessControl.control()) {
+          case 'entity':
+            if(!details.entityFields) {
+              details.entityFields = []
+            }
+            if(result.entityFields) {
+              details.entityFields = details.entityFields.concat(result.entityFields)
+            }
+            break
           case 'filter':
             if(!details.filters) {
               details.filters = []
